@@ -51,26 +51,32 @@ const SENTENCE_START_RE = /^\s*["'`*_【『「]?[A-Z`\u3400-\u4DBF\u4E00-\u9FFF\
 
 const OUTSTANDING_CLIP = 200;
 
-/** Path-like tokens (`src/a.ts`, `/repo/b.md`) used to match an error to its retry.
- *
- * Two-phase linear scan. The previous single pattern
- * `[A-Za-z0-9_.$/-]*[A-Za-z0-9_-]+\.[A-Za-z0-9]{1,5}\b` has overlapping adjacent
- * classes, so on a long dotless alphanumeric run it backtracks through every
- * (prefix, middle, start) triple — cubic in run length. A ~37 KB dotless run
- * (e.g. a large table/JSON tool result) froze `session_before_compact` for 49
- * minutes in the wild. Phase 1 cuts maximal filename-ish runs (one class, no
- * ambiguity); phase 2 takes the rightmost valid dot split per run — `.*` is
- * greedy and backtracks dot-to-dot, bounded by the run, so total work is linear
- * in text length. A differential fuzz over 200k inputs yields identical token
- * sets to the old pattern. */
-const PATH_RUN_RE = /[A-Za-z0-9_.$/-]+/g;
-const PATH_TAIL_RE = /^.*[A-Za-z0-9_-]\.[A-Za-z0-9]{1,5}(?![A-Za-z0-9_])/;
+// Bounds for path-token scanning: tool results can carry multi-megabyte
+// encoded blobs, so neither the scanned length nor the collected token set
+// may grow without bound. Real paths are short, so a head+tail window still
+// reaches a relevant path at either end of a result while the blob middle is
+// skipped; the token cap additionally bounds the error/success intersection.
+const MAX_PATH_TOKENS = 200;
+const PATH_SCAN_HEAD = 8000;
+const PATH_SCAN_TAIL = 8000;
 
-const pathTokens = (text: string): Set<string> => {
+/** Path-like tokens (`src/a.ts`, `/repo/b.md`) used to match an error to its retry. */
+export const pathTokens = (text: string): Set<string> => {
   const out = new Set<string>();
-  for (const run of text.matchAll(PATH_RUN_RE)) {
-    const m = run[0].match(PATH_TAIL_RE);
-    if (m) out.add(m[0].toLowerCase());
+  // Scan each token once without overlapping repetitions that backtrack on encoded blobs.
+  const scan = (chunk: string): void => {
+    for (const m of chunk.matchAll(
+      /(?<![A-Za-z0-9_.$/-])[A-Za-z0-9_.$/-]*(?<=[A-Za-z0-9_-])\.[A-Za-z0-9]{1,5}\b/g,
+    )) {
+      out.add(m[0].toLowerCase());
+      if (out.size >= MAX_PATH_TOKENS) break;
+    }
+  };
+  if (text.length <= PATH_SCAN_HEAD + PATH_SCAN_TAIL) {
+    scan(text);
+  } else {
+    scan(text.slice(0, PATH_SCAN_HEAD));
+    if (out.size < MAX_PATH_TOKENS) scan(text.slice(-PATH_SCAN_TAIL));
   }
   return out;
 };
